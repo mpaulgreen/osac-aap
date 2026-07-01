@@ -18,6 +18,12 @@
     # Simulate admin_kubeconfig (normally set by ocp_4_17_small pipeline)
     admin_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('~/.kube/config', true) }}"
 
+  pre_tasks:
+    - name: Force enable_keycloak=false when enable_maas=false
+      ansible.builtin.set_fact:
+        ocp_4_20_ai_maas_enable_keycloak: false
+      when: not (ocp_4_20_ai_maas_enable_maas | default(true) | bool)
+
   tasks:
     # --- Install Operators (BOM Phase 2 + 3) ---
     - name: Install platform operators
@@ -32,6 +38,21 @@
         - operators
         - all
 
+    # --- Configure cluster (gateway, observability) ---
+    - name: Configure cluster
+      ansible.builtin.include_role:
+        name: osac.templates.ocp_4_20_ai_maas
+        tasks_from: configure_cluster.yaml
+        apply:
+          tags:
+            - cluster
+            - maas
+            - all
+      tags:
+        - cluster
+        - maas
+        - all
+
     # --- Configure MaaS (Phases 1-5) ---
     - name: Configure MaaS platform
       ansible.builtin.include_role:
@@ -44,6 +65,7 @@
       tags:
         - maas
         - all
+      when: ocp_4_20_ai_maas_enable_maas | default(true) | bool
 
     # --- Verification ---
     - name: Run verification tests

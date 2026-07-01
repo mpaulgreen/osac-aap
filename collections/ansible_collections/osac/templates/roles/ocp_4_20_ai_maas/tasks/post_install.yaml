@@ -16,9 +16,12 @@
 - name: Install platform operators (BOM Phase 2 + 3)
   ansible.builtin.include_tasks: install_operators.yaml
 
+- name: Configure cluster (gateway, observability)
+  ansible.builtin.include_tasks: configure_cluster.yaml
+
 - name: Configure MaaS platform (Phases 1-5)
   ansible.builtin.include_tasks: configure_maas.yaml
-  when: ocp_4_20_ai_maas_enable_maas | default(true)
+  when: ocp_4_20_ai_maas_enable_maas | default(true) | bool
 
 - name: Run verification smoke tests
   ansible.builtin.include_tasks: verify.yaml

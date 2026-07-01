@@ -22,9 +22,29 @@
 
 - name: Derive test users from tiers
   ansible.builtin.set_fact:
-    _premium_tier: "{{ ocp_4_20_ai_maas_tiers | selectattr('priority', 'greaterthan', 0) | first }}"
-    _free_tier: "{{ ocp_4_20_ai_maas_tiers | selectattr('priority', 'equalto', 0) | first }}"
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+    _premium_tier: "{{ ocp_4_20_ai_maas_tiers | selectattr('priority', 'greaterthan', 0) | first | default({}) }}"
+    _free_tier: "{{ ocp_4_20_ai_maas_tiers | selectattr('priority', 'equalto', 0) | first | default({}) }}"
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
+
+# EE containers may have empty /etc/resolv.conf — populate with CoreDNS + public fallbacks.
+# Falls back to 8.8.8.8 / 1.1.1.1 if CoreDNS IP is non-standard.
+- name: Fix external/internal DNS resolution for EE containers
+  environment:
+    GW_HOSTNAME: "{{ ocp_4_20_ai_maas_gateway_hostname }}.{{ _cluster_domain }}"
+  ansible.builtin.shell: |
+    python3 -c "import os,socket; socket.getaddrinfo(os.environ['GW_HOSTNAME'], 443)" 2>/dev/null && exit 0
+    if [ ! -s /etc/resolv.conf ] || ! grep -q nameserver /etc/resolv.conf 2>/dev/null; then
+      {
+        echo "nameserver 172.30.0.10"
+        echo "nameserver 8.8.8.8"
+        echo "nameserver 1.1.1.1"
+      } > /etc/resolv.conf 2>/dev/null || true
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+  ignore_errors: true
+  when: ocp_4_20_ai_maas_enable_maas | bool
 
 # --- Test 1: Unauthenticated inference must return 401 ---
 
@@ -44,10 +64,15 @@
       - 403
     validate_certs: false
   register: _unauth_test
+  retries: 6
+  delay: 10
+  until: _unauth_test.status in [401, 403]
+  when: ocp_4_20_ai_maas_enable_maas | bool
 
 - name: Report auth enforcement
   ansible.builtin.debug:
     msg: "Auth enforcement: HTTP {{ _unauth_test.status }} (401=auth rejected, 403=OPA denied — both confirm enforcement)"
+  when: ocp_4_20_ai_maas_enable_maas | bool
 
 # --- Test 2: API key creation with Keycloak JWT ---
 
@@ -65,7 +90,7 @@
     validate_certs: false
   no_log: true
   register: _jwt_response
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Create API key
   ansible.builtin.uri:
@@ -81,12 +106,12 @@
     validate_certs: false
   no_log: true
   register: _api_key_response
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Report API key creation
   ansible.builtin.debug:
-    msg: "API key created: {{ _api_key_response.json.keyPrefix | default('N/A') }} subscription={{ _api_key_response.json.subscription | default('N/A') }}"
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+    msg: "API key created successfully, subscription={{ _api_key_response.json.subscription | default('N/A') }}"
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 # --- Test 3: Inference with API key ---
 
@@ -112,19 +137,20 @@
   retries: 6
   delay: 10
   until: _inference_test.status == 200
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Fail if inference never succeeded
   ansible.builtin.fail:
     msg: "Inference test failed — last status {{ _inference_test.status }}. Auth pipeline may not be ready."
   when:
-    - ocp_4_20_ai_maas_enable_keycloak | default(true)
+    - ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
+    - _inference_test is defined
     - _inference_test.status != 200
 
 - name: Report inference
   ansible.builtin.debug:
     msg: "Inference: HTTP {{ _inference_test.status }} tokens={{ _inference_test.json.usage.total_tokens | default('?') }}"
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 # --- Test 4: Version pinning ---
 
@@ -138,12 +164,72 @@
 
 # TEMPORARY WORKAROUND: Remove this assertion once RHCL v1.4.0 compatibility
 # with SM is resolved and version pinning is no longer needed.
-- name: Assert no v1.4.0 CSVs installed
+- name: Assert no RHCL v1.4.0 CSVs installed
   ansible.builtin.assert:
     that:
-      - _all_csvs.resources | selectattr('metadata.name', 'search', 'v1.4.0') | list | length == 0
+      - >-
+        _all_csvs.resources
+        | selectattr('metadata.name', 'match', '(rhcl|authorino|limitador|dns)-operator')
+        | selectattr('metadata.name', 'search', 'v1\\.4\\.0')
+        | list | length == 0
     fail_msg: "RHCL v1.4.0 detected — version pinning failed"
     success_msg: "All RHCL operators at v1.3.x — version pinning held"
+  when: ocp_4_20_ai_maas_enable_maas | bool
+
+# --- Test 4b: Observability stack ---
+
+- name: Get COO CSV status
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ ocp_4_20_ai_maas_coo_starting_csv }}"
+    namespace: openshift-cluster-observability-operator
+  register: _coo_csv
+  when: ocp_4_20_ai_maas_enable_observability | default(true) | bool
+
+- name: Get OTel Subscription status
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ ocp_4_20_ai_maas_otel_package }}"
+    namespace: openshift-opentelemetry-operator
+  register: _otel_csv
+  when: ocp_4_20_ai_maas_enable_observability | default(true) | bool
+
+- name: Wait for Perses pod running
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: redhat-ods-monitoring
+    label_selectors:
+      - app.kubernetes.io/name=data-science-perses
+  register: _perses_verify
+  retries: "{{ ocp_4_20_ai_maas_operator_retries }}"
+  delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
+  ignore_errors: true
+  until:
+    - _perses_verify.resources is defined
+    - _perses_verify.resources | length > 0
+    - _perses_verify.resources[0].status.phase | default('') == 'Running'
+  when: ocp_4_20_ai_maas_enable_observability | default(true) | bool
+
+- name: Verify observability stack
+  ansible.builtin.assert:
+    that:
+      - _coo_csv.resources | length > 0
+      - _coo_csv.resources[0].status.phase | default('') == 'Succeeded'
+      - _otel_csv.resources | length > 0
+      - _otel_csv.resources[0].status.installedCSV is defined
+      - _perses_verify.resources | length > 0
+      - _perses_verify.resources[0].status.phase | default('') == 'Running'
+    fail_msg: "Observability stack not fully operational"
+    success_msg: >-
+      Observability: COO={{ ocp_4_20_ai_maas_coo_starting_csv }},
+      Perses=Running
+  when: ocp_4_20_ai_maas_enable_observability | default(true) | bool
 
 # --- Test 5: Token rate limiting (free tier) ---
 
@@ -161,7 +247,7 @@
     validate_certs: false
   no_log: true
   register: _free_jwt
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Create free-tier API key
   ansible.builtin.uri:
@@ -177,7 +263,7 @@
     validate_certs: false
   no_log: true
   register: _free_key_response
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Send requests to exhaust free tier (100 tokens/min)
   ansible.builtin.uri:
@@ -201,7 +287,7 @@
   loop: "{{ range(1, 11) | list }}"
   loop_control:
     label: "request {{ item }}"
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Assert rate limiting was enforced
   ansible.builtin.assert:
@@ -211,11 +297,13 @@
     success_msg: >-
       Rate limiting enforced — {{ _rate_limit_results.results
       | selectattr('status', 'equalto', 429) | list | length }} of 10 requests returned 429
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Report verification complete
   ansible.builtin.debug:
     msg: >-
       All verification tests passed —
-      Auth: {{ _unauth_test.status }},
-      {{ 'API key: created, Inference: 200, Rate limiting: 429, ' if (ocp_4_20_ai_maas_enable_keycloak | default(true)) else '' }}Versions: all v1.3.x pinned
+      MaaS: {{ ocp_4_20_ai_maas_enable_maas | bool }},
+      Keycloak: {{ ocp_4_20_ai_maas_enable_keycloak | bool }},
+      Dashboard: {{ ocp_4_20_ai_maas_enable_dashboard | bool }},
+      {{ 'API key: created, Inference: 200, Rate limiting: 429, ' if (ocp_4_20_ai_maas_enable_keycloak | bool) else '' }}{{ 'Versions: all v1.3.x pinned, ' if (ocp_4_20_ai_maas_enable_maas | bool) else '' }}{{ 'Observability: COO+OTel+Perses' if (ocp_4_20_ai_maas_enable_observability | bool) else '' }}

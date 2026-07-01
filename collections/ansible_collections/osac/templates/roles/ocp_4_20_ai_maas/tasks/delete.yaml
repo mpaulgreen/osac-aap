@@ -147,7 +147,7 @@
       metadata:
         name: "{{ ocp_4_20_ai_maas_keycloak_namespace }}"
   ignore_errors: true
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Remove models-as-a-service namespace
   kubernetes.core.k8s:

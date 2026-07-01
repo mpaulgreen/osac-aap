@@ -1,46 +1,29 @@
 ---
 # MaaS deployment: Keycloak → prereqs → enable MaaS → model → subscriptions
 # Translates design-thinking/maas/README.md Phases 1-5 into Ansible tasks.
+# Cluster domain (_cluster_domain, _cert_name) set by configure_cluster.yaml.
 
-# --- Discover cluster domain ---
+# --- Validate parameters ---
 
-- name: Get cluster ingress domain
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ admin_kubeconfig }}"
-    api_version: config.openshift.io/v1
-    kind: Ingress
-    name: cluster
-  register: _ingress_config
-
-- name: Set cluster domain
-  ansible.builtin.set_fact:
-    _cluster_domain: "{{ _ingress_config.resources[0].spec.domain }}"
-
-- name: Get ingress certificate name
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ admin_kubeconfig }}"
-    api_version: operator.openshift.io/v1
-    kind: IngressController
-    name: default
-    namespace: openshift-ingress-operator
-  register: _ingress_controller
-
-- name: Set certificate name
-  ansible.builtin.set_fact:
-    _cert_name: >-
-      {{ (_ingress_controller.resources[0].spec.defaultCertificate | default({})).name
-         | default(ocp_4_20_ai_maas_gateway_cert_name) }}
-
-- name: Report cluster info
-  ansible.builtin.debug:
-    msg:
-      - "Cluster domain: {{ _cluster_domain }}"
-      - "Certificate: {{ _cert_name }}"
+- name: Validate oidc_issuer and oidc_client_id when using external IdP
+  ansible.builtin.assert:
+    that:
+      - ocp_4_20_ai_maas_oidc_issuer is defined
+      - ocp_4_20_ai_maas_oidc_issuer | length > 0
+      - ocp_4_20_ai_maas_oidc_client_id is defined
+      - ocp_4_20_ai_maas_oidc_client_id | length > 0
+    fail_msg: >-
+      oidc_issuer and oidc_client_id are required when enable_maas=true and
+      enable_keycloak=false. Provide the OIDC issuer URL and client ID of
+      your external identity provider.
+  when:
+    - ocp_4_20_ai_maas_enable_maas | bool
+    - not (ocp_4_20_ai_maas_enable_keycloak | bool)
 
 # --- Phase 1: Keycloak (conditional) ---
 
 - name: Deploy Keycloak MaaS instance
-  when: ocp_4_20_ai_maas_enable_keycloak | default(true)
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
   block:
     - name: Apply Keycloak resources (namespace, RHBK, PostgreSQL, instance, route)
       kubernetes.core.k8s:
@@ -147,19 +130,6 @@
 
 # --- Phase 2: MaaS Prerequisites ---
 
-- name: Apply User Workload Monitoring
-  kubernetes.core.k8s:
-    kubeconfig: "{{ admin_kubeconfig }}"
-    state: present
-    definition: "{{ item }}"
-  loop: "{{ lookup('ansible.builtin.template', 'user-workload-monitoring.yaml.j2') | from_yaml_all | list }}"
-  loop_control:
-    label: "{{ item.kind }}/{{ item.metadata.name }}"
-  register: _r
-  retries: 5
-  delay: 10
-  until: _r is not failed
-
 - name: Apply Kuadrant resources (namespace, service, Kuadrant, Authorino)
   kubernetes.core.k8s:
     kubeconfig: "{{ admin_kubeconfig }}"
@@ -230,6 +200,43 @@
       | selectattr('type', 'equalto', 'Programmed')
       | selectattr('status', 'equalto', 'True')
       | list | length > 0
+
+# Create maas-db namespace first — PVC creation can fail silently if namespace
+# isn't fully active (admission webhooks, quota controllers need time).
+- name: Create maas-db namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: maas-db
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+
+- name: Create maas-postgres PVC
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: maas-postgres-pvc
+        namespace: maas-db
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "{{ ocp_4_20_ai_maas_db_storage }}"
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
 
 - name: Apply PostgreSQL for maas-api
   kubernetes.core.k8s:
@@ -352,11 +359,18 @@
         externalOIDC: >-
           {{ {'issuerUrl': 'https://' + ocp_4_20_ai_maas_keycloak_namespace + '.' + _cluster_domain + '/realms/' + ocp_4_20_ai_maas_keycloak_realm,
               'clientId': ocp_4_20_ai_maas_keycloak_client_id}
-             if ocp_4_20_ai_maas_enable_keycloak else omit }}
+             if ocp_4_20_ai_maas_enable_keycloak | bool
+             else {'issuerUrl': ocp_4_20_ai_maas_oidc_issuer,
+                   'clientId': ocp_4_20_ai_maas_oidc_client_id} }}
         apiKeys:
           maxExpirationDays: "{{ ocp_4_20_ai_maas_api_key_max_expiration_days }}"
         telemetry:
-          enabled: true
+          enabled: "{{ ocp_4_20_ai_maas_telemetry_enabled }}"
+          metrics:
+            captureUser: "{{ ocp_4_20_ai_maas_telemetry_capture_user }}"
+            captureGroup: "{{ ocp_4_20_ai_maas_telemetry_capture_group }}"
+            captureOrganization: "{{ ocp_4_20_ai_maas_telemetry_capture_organization }}"
+            captureModelUsage: "{{ ocp_4_20_ai_maas_telemetry_capture_model_usage }}"
     merge_type: merge
   register: _r
   retries: 5
@@ -378,6 +392,39 @@
     - _tenant.resources is defined
     - _tenant.resources | length > 0
     - _tenant.resources[0].status.phase | default('') == 'Active'
+
+- name: Fail if Tenant never became Active
+  ansible.builtin.fail:
+    msg: >-
+      Tenant {{ ocp_4_20_ai_maas_tenant_name }} did not become Active after
+      {{ ocp_4_20_ai_maas_operator_retries }} retries.
+  when: >-
+    _tenant.resources is not defined
+    or _tenant.resources | length == 0
+    or _tenant.resources[0].status.phase | default('') != 'Active'
+
+# --- Phase 3b: Dashboard feature flags ---
+
+- name: Patch OdhDashboardConfig with MaaS feature flags
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    merge_type: merge
+    definition:
+      apiVersion: opendatahub.io/v1alpha
+      kind: OdhDashboardConfig
+      metadata:
+        name: odh-dashboard-config
+        namespace: redhat-ods-applications
+      spec:
+        dashboardConfig:
+          modelAsService: true
+          maasAuthPolicies: true
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+  when: ocp_4_20_ai_maas_enable_dashboard | bool
 
 # --- Phase 4: Deploy Model ---
 
@@ -424,6 +471,18 @@
       | selectattr('status', 'equalto', 'True')
       | list | length > 0
 
+- name: Fail if LLMInferenceService never became Ready
+  ansible.builtin.fail:
+    msg: >-
+      LLMInferenceService {{ ocp_4_20_ai_maas_model_name }} did not become Ready.
+  when: >-
+    _llm.resources is not defined
+    or _llm.resources | length == 0
+    or (_llm.resources[0].status.conditions | default([])
+       | selectattr('type', 'equalto', 'Ready')
+       | selectattr('status', 'equalto', 'True')
+       | list | length == 0)
+
 - name: Create MaaSModelRef
   kubernetes.core.k8s:
     kubeconfig: "{{ admin_kubeconfig }}"
@@ -449,6 +508,15 @@
     - _modelref.resources is defined
     - _modelref.resources | length > 0
     - _modelref.resources[0].status.phase | default('') == 'Ready'
+
+- name: Fail if MaaSModelRef never became Ready
+  ansible.builtin.fail:
+    msg: >-
+      MaaSModelRef {{ ocp_4_20_ai_maas_model_name }} did not become Ready.
+  when: >-
+    _modelref.resources is not defined
+    or _modelref.resources | length == 0
+    or _modelref.resources[0].status.phase | default('') != 'Ready'
 
 # --- Phase 5: Auth Policies + Subscriptions ---
 
@@ -488,6 +556,86 @@
   until:
     - _auth_policy.resources is defined
     - _auth_policy.resources | length > 0
+
+# Restart maas-controller to force fresh subscription reconciliation.
+# The controller can hit a leader election timeout during initial subscription
+# creation, reading TRLP status before Kuadrant fully accepts it. Without a
+# restart, subscriptions stay Degraded and inference returns 403.
+- name: Restart maas-controller for subscription reconciliation
+  environment:
+    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+  ansible.builtin.shell: |
+    oc rollout restart deployment/maas-controller -n redhat-ods-applications
+    oc rollout status deployment/maas-controller -n redhat-ods-applications --timeout=180s
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Wait for all subscriptions Active
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: MaaSSubscription
+    namespace: models-as-a-service
+  register: _subs
+  retries: "{{ ocp_4_20_ai_maas_operator_retries }}"
+  delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
+  ignore_errors: true
+  until:
+    - _subs.resources is defined
+    - _subs.resources | length > 0
+    - >-
+      _subs.resources
+      | selectattr('status.phase', 'defined')
+      | selectattr('status.phase', 'equalto', 'Active')
+      | list | length == _subs.resources | length
+
+- name: Fail if subscriptions never became Active
+  ansible.builtin.fail:
+    msg: >-
+      Not all MaaSSubscriptions became Active after
+      {{ ocp_4_20_ai_maas_operator_retries }} retries.
+  when: >-
+    _subs.resources is not defined
+    or _subs.resources | length == 0
+    or (_subs.resources
+       | selectattr('status.phase', 'defined')
+       | selectattr('status.phase', 'equalto', 'Active')
+       | list | length != _subs.resources | length)
+
+# Wait for TokenRateLimitPolicy to fully propagate to Limitador after controller
+# restart. Without this, rate limiting verify tests fail (all 200, no 429).
+- name: Wait for TokenRateLimitPolicy enforcement
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: kuadrant.io/v1alpha1
+    kind: TokenRateLimitPolicy
+    namespace: "{{ ocp_4_20_ai_maas_model_namespace }}"
+  register: _trlp
+  retries: 12
+  delay: 10
+  ignore_errors: true
+  until:
+    - _trlp.resources is defined
+    - _trlp.resources | length > 0
+    - >-
+      _trlp.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Enforced')
+      | selectattr('status', 'equalto', 'True')
+      | list | length > 0
+
+- name: Fail if TRLP enforcement never converged
+  ansible.builtin.fail:
+    msg: >-
+      TokenRateLimitPolicy did not reach Enforced state.
+      Rate limiting may not be active.
+  when: >-
+    _trlp.resources is not defined
+    or _trlp.resources | length == 0
+    or (_trlp.resources[0].status.conditions | default([])
+       | selectattr('type', 'equalto', 'Enforced')
+       | selectattr('status', 'equalto', 'True')
+       | list | length == 0)
 
 - name: Report MaaS configuration complete
   ansible.builtin.debug:

@@ -5,6 +5,10 @@ ocp_4_20_ai_maas_ocp_release_image: quay.io/openshift-release-dev/ocp-release:4.
 # Feature flags
 ocp_4_20_ai_maas_enable_maas: true
 ocp_4_20_ai_maas_enable_keycloak: true
+ocp_4_20_ai_maas_oidc_issuer: ""
+ocp_4_20_ai_maas_oidc_client_id: ""
+ocp_4_20_ai_maas_enable_observability: true
+ocp_4_20_ai_maas_enable_dashboard: true
 ocp_4_20_ai_maas_run_verify: true
 
 # --- Platform Operators ---
@@ -15,21 +19,30 @@ ocp_4_20_ai_maas_cert_manager_source: redhat-operators
 
 # Service Mesh (must install BEFORE RHCL)
 ocp_4_20_ai_maas_sm_channel: stable-3.2
-ocp_4_20_ai_maas_sm_starting_csv: servicemeshoperator3.v3.2.6
+ocp_4_20_ai_maas_sm_starting_csv: servicemeshoperator3.v3.2.7
 ocp_4_20_ai_maas_sm_source: redhat-operators
 
 # RHCL sub-operators (pre-create to prevent OLM auto-upgrade to v1.4.0)
-ocp_4_20_ai_maas_authorino_starting_csv: authorino-operator.v1.3.1
+ocp_4_20_ai_maas_authorino_starting_csv: authorino-operator.v1.3.2
 ocp_4_20_ai_maas_limitador_starting_csv: limitador-operator.v1.3.1
 ocp_4_20_ai_maas_dns_starting_csv: dns-operator.v1.3.1
 
 # RHCL operator
-ocp_4_20_ai_maas_rhcl_starting_csv: rhcl-operator.v1.3.4
+ocp_4_20_ai_maas_rhcl_starting_csv: rhcl-operator.v1.3.5
 ocp_4_20_ai_maas_rhcl_source: redhat-operators
 
 # Version to reject/accept in install plans
 ocp_4_20_ai_maas_reject_version: "v1.4.0"
 ocp_4_20_ai_maas_accept_version: "v1.3"
+
+# Observability operators (COO + OTel, installed in isolated namespaces)
+ocp_4_20_ai_maas_coo_starting_csv: cluster-observability-operator.v1.4.0
+ocp_4_20_ai_maas_coo_source: redhat-operators
+ocp_4_20_ai_maas_otel_package: opentelemetry-product
+ocp_4_20_ai_maas_otel_source: redhat-operators
+ocp_4_20_ai_maas_dsci_metrics_replicas: 1
+ocp_4_20_ai_maas_dsci_metrics_retention: 7d
+ocp_4_20_ai_maas_dsci_metrics_storage: 10Gi
 
 # Leader Worker Set
 ocp_4_20_ai_maas_lws_channel: stable-v1.0
@@ -63,7 +76,8 @@ ocp_4_20_ai_maas_gateway_cert_name: router-certs
 # PostgreSQL
 ocp_4_20_ai_maas_db_image: registry.redhat.io/rhel9/postgresql-16:latest
 ocp_4_20_ai_maas_db_user: maas
-ocp_4_20_ai_maas_db_password: maas-db-password  # Override in production
+# DEV ONLY — override all credential defaults in production deployments
+ocp_4_20_ai_maas_db_password: maas-db-password
 ocp_4_20_ai_maas_db_name: maas
 ocp_4_20_ai_maas_db_storage: 5Gi
 
@@ -71,16 +85,23 @@ ocp_4_20_ai_maas_db_storage: 5Gi
 ocp_4_20_ai_maas_keycloak_namespace: keycloak-maas
 ocp_4_20_ai_maas_keycloak_channel: stable-v26.4
 ocp_4_20_ai_maas_keycloak_instances: 1
-ocp_4_20_ai_maas_keycloak_db_password: keycloak-db-password  # Override in production
+ocp_4_20_ai_maas_keycloak_db_password: keycloak-db-password
 ocp_4_20_ai_maas_keycloak_db_storage: 5Gi
 ocp_4_20_ai_maas_keycloak_realm: maas
 ocp_4_20_ai_maas_keycloak_client_id: maas-client
-ocp_4_20_ai_maas_keycloak_client_secret: maas-client-secret-value  # Override in production
-ocp_4_20_ai_maas_keycloak_test_password: password123  # Override in production
+ocp_4_20_ai_maas_keycloak_client_secret: maas-client-secret-value
+ocp_4_20_ai_maas_keycloak_test_password: password123
 
 # Tenant
 ocp_4_20_ai_maas_tenant_name: default-tenant
 ocp_4_20_ai_maas_api_key_max_expiration_days: 90
+
+# Tenant telemetry (captureUser defaults to true for Usage tab; privacy-sensitive)
+ocp_4_20_ai_maas_telemetry_enabled: true
+ocp_4_20_ai_maas_telemetry_capture_user: true
+ocp_4_20_ai_maas_telemetry_capture_group: true
+ocp_4_20_ai_maas_telemetry_capture_organization: true
+ocp_4_20_ai_maas_telemetry_capture_model_usage: true
 
 # Model
 ocp_4_20_ai_maas_model_name: facebook-opt-125m-simulated

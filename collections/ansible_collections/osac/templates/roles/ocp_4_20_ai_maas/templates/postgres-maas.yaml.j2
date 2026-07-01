@@ -1,21 +1,4 @@
 apiVersion: v1
-kind: Namespace
-metadata:
-  name: maas-db
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: maas-postgres-pvc
-  namespace: maas-db
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: {{ ocp_4_20_ai_maas_db_storage }}
----
-apiVersion: v1
 kind: Secret
 metadata:
   name: maas-postgres-credentials
