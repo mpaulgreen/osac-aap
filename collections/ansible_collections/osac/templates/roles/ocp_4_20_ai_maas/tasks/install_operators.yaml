@@ -40,6 +40,7 @@
       - ocp_4_20_ai_maas_sm_starting_csv is regex('^[\w.\-]+$')
       - ocp_4_20_ai_maas_coo_starting_csv is regex('^[\w.\-]+$')
     fail_msg: "Shell-interpolated variables contain invalid characters"
+  when: not (ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool)
 
 # --- Step 1: cert-manager ---
 # RHCL 1.3 requires cert-manager 1.18 per https://access.redhat.com/articles/7092611
@@ -149,7 +150,9 @@
 # Only installed when enable_maas is true. For inference-only clusters, SM 3
 # auto-installs via RHOAI DSC — no version pinning or sub-operators needed.
 - name: Install MaaS gateway operators (SM, RHCL, sub-operators)
-  when: ocp_4_20_ai_maas_enable_maas | bool
+  when:
+    - ocp_4_20_ai_maas_enable_maas | bool
+    - not (ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool)
   block:
     # Delete stale subscriptions, CSVs, and install plans from prior runs.
     # state:present updates spec but NOT status.installedCSV — stale installedCSV
@@ -469,6 +472,102 @@
       delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
       until: _rhcl_result.rc == 0
       changed_when: false
+
+# --- Steps 2-4 (simplified): RHCL without version pinning (RHOAI 3.5) ---
+# When skip_version_pinning is true, install RHCL with Automatic approval.
+# RHOAI 3.5 auto-manages SM via DSC; RHCL 1.4.x dual-anchor EnvoyFilter
+# supports both SM 3.2 and 3.3+. No sub-operator pre-creation needed.
+- name: Install SM + RHCL (no version pinning — RHOAI 3.5 mode)
+  when:
+    - ocp_4_20_ai_maas_enable_maas | bool
+    - ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool
+  block:
+    # SM operator must be installed for Kuadrant to detect Gateway API provider.
+    # RHOAI auto-installs SM via DSC, but Kuadrant CR is created in configure_maas
+    # before DSC triggers SM — so SM must be pre-installed here.
+    - name: Create SM Subscription (Automatic, stable channel)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ admin_kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: servicemeshoperator3
+            namespace: openshift-operators
+          spec:
+            channel: "{{ ocp_4_20_ai_maas_sm_channel }}"
+            installPlanApproval: Automatic
+            name: servicemeshoperator3
+            source: "{{ ocp_4_20_ai_maas_sm_source }}"
+            sourceNamespace: openshift-marketplace
+      register: _r
+      retries: 5
+      delay: 10
+      until: _r is not failed
+
+    - name: Wait for SM CSV Succeeded
+      environment:
+        KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          CSV=$(oc get csv -n openshift-operators --no-headers 2>/dev/null | grep "servicemeshoperator3" | awk '{print $1, $NF}')
+          if echo "$CSV" | grep -q "Succeeded"; then
+            echo "SM ready: $CSV"
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "SM did not reach Succeeded after 300s"
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _sm_simple
+      changed_when: false
+
+    - name: Create RHCL Subscription (Automatic, stable channel)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ admin_kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: rhcl-operator
+            namespace: openshift-operators
+          spec:
+            channel: stable
+            installPlanApproval: Automatic
+            name: rhcl-operator
+            source: "{{ ocp_4_20_ai_maas_rhcl_source }}"
+            sourceNamespace: openshift-marketplace
+      register: _r
+      retries: 5
+      delay: 10
+      until: _r is not failed
+
+    - name: Wait for RHCL CSV Succeeded
+      environment:
+        KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          CSV=$(oc get csv -n openshift-operators --no-headers 2>/dev/null | grep "rhcl-operator" | awk '{print $1, $NF}')
+          if echo "$CSV" | grep -q "Succeeded"; then
+            echo "RHCL ready: $CSV"
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "RHCL did not reach Succeeded after 300s"
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _rhcl_simple
+      changed_when: false
+
+    - name: Report RHCL version
+      ansible.builtin.debug:
+        msg: "{{ _rhcl_simple.stdout }}"
 
 # --- Step 5: Leader Worker Set ---
 

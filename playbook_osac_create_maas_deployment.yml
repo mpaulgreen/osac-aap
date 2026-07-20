@@ -1,15 +1,15 @@
 ---
-# Playbook: deploy MaaS on RHOAI 3.4 via ocp_4_20_ai_maas template role.
+# Playbook: deploy MaaS on RHOAI via ocp_4_20_ai_maas template role.
 # Runs the role's task files directly against a live cluster.
 #
 # Usage:
-#   ansible-playbook playbook_osac_create_maas_deployment.yml --tags all -v
+#   ansible-playbook playbook_osac_create_maas_deployment.yml --tags full -v
 #   ansible-playbook playbook_osac_create_maas_deployment.yml --tags operators
 #   ansible-playbook playbook_osac_create_maas_deployment.yml --tags maas
 #   ansible-playbook playbook_osac_create_maas_deployment.yml --tags verify
 #   ansible-playbook playbook_osac_create_maas_deployment.yml --tags cleanup
 
-- name: Deploy MaaS on RHOAI 3.4
+- name: Deploy MaaS on RHOAI
   hosts: localhost
   gather_facts: false
   connection: local
@@ -33,10 +33,10 @@
         apply:
           tags:
             - operators
-            - all
+            - full
       tags:
         - operators
-        - all
+        - full
 
     # --- Configure cluster (gateway, observability) ---
     - name: Configure cluster
@@ -47,11 +47,11 @@
           tags:
             - cluster
             - maas
-            - all
+            - full
       tags:
         - cluster
         - maas
-        - all
+        - full
 
     # --- Configure MaaS (Phases 1-5) ---
     - name: Configure MaaS platform
@@ -61,10 +61,10 @@
         apply:
           tags:
             - maas
-            - all
+            - full
       tags:
         - maas
-        - all
+        - full
       when: ocp_4_20_ai_maas_enable_maas | default(true) | bool
 
     # --- Verification ---
@@ -75,10 +75,10 @@
         apply:
           tags:
             - verify
-            - all
+            - full
       tags:
         - verify
-        - all
+        - full
 
     # --- Cleanup ---
     - name: Undeploy everything

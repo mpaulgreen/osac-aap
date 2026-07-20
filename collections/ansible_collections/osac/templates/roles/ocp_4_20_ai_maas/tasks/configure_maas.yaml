@@ -130,6 +130,37 @@
 
 # --- Phase 2: MaaS Prerequisites ---
 
+# Wait for Istio/Gateway API provider before Kuadrant. The Ingress Operator
+# manages istiod and GatewayClass on OCP 4.21+. After a cluster cleanup these
+# resources need time to be recreated. Kuadrant won't become Ready without them.
+- name: Wait for GatewayClass to be available
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: gateway.networking.k8s.io/v1
+    kind: GatewayClass
+    name: data-science-gateway-class
+  register: _gwclass
+  retries: 30
+  delay: 10
+  until:
+    - _gwclass.resources is defined
+    - _gwclass.resources | length > 0
+
+- name: Wait for istiod deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    name: istiod-openshift-gateway
+    namespace: openshift-ingress
+  register: _istiod
+  retries: 30
+  delay: 10
+  until:
+    - _istiod.resources is defined
+    - _istiod.resources | length > 0
+    - (_istiod.resources[0].status.availableReplicas | default(0)) > 0
+
 - name: Apply Kuadrant resources (namespace, service, Kuadrant, Authorino)
   kubernetes.core.k8s:
     kubeconfig: "{{ admin_kubeconfig }}"
@@ -142,6 +173,57 @@
   retries: 5
   delay: 10
   until: _r is not failed
+
+# RHCL 1.4.x / 1.5.x: Kuadrant operator detects dependencies ONLY at startup.
+# If istio, Authorino operator, or Limitador operator weren't ready when the
+# operator pod started, it skips their watches permanently. Must restart AFTER
+# all dependencies are confirmed running. Wait for all 4 then restart.
+- name: Wait for Authorino operator deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    name: authorino-operator
+    namespace: openshift-operators
+  register: _authorino_op
+  retries: 30
+  delay: 10
+  until:
+    - _authorino_op.resources is defined
+    - _authorino_op.resources | length > 0
+    - (_authorino_op.resources[0].status.availableReplicas | default(0)) > 0
+  when: ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool
+
+- name: Wait for Limitador operator deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: openshift-operators
+  register: _limitador_op
+  retries: 30
+  delay: 10
+  until:
+    - _limitador_op.resources is defined
+    - (_limitador_op.resources | selectattr('metadata.name', 'match', 'limitador-operator') | list | length) > 0
+  when: ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool
+
+# Force-delete the Kuadrant operator pod (not rollout restart — same ReplicaSet
+# revision means rollout restart is a no-op). The new pod starts fresh and
+# detects all dependencies at startup.
+- name: Force-restart Kuadrant operator to detect all providers
+  environment:
+    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+  ansible.builtin.shell: |
+    POD=$(oc get pods -n openshift-operators --no-headers | grep kuadrant-operator-controller | awk '{print $1}')
+    oc delete pod "$POD" -n openshift-operators --force --grace-period=0
+    sleep 15
+    oc wait --for=condition=Available deployment/kuadrant-operator-controller-manager \
+      -n openshift-operators --timeout=120s
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool
 
 - name: Wait for Kuadrant ready
   kubernetes.core.k8s_info:
@@ -493,6 +575,47 @@
   delay: 10
   until: _r is not failed
 
+# --- Phase 5: Auth Policies + Subscriptions ---
+# RHOAI 3.5: MaaSModelRef requires GovernanceAttached (AuthPolicy + Subscription)
+# before it becomes Ready. Create governance CRs BEFORE waiting for ModelRef Ready.
+
+- name: Create MaaSAuthPolicy
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'maas-auth-policy.yaml.j2') | from_yaml }}"
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+
+- name: Create MaaSSubscriptions
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    definition: "{{ item }}"
+  loop: "{{ lookup('ansible.builtin.template', 'maas-subscriptions.yaml.j2') | from_yaml_all | list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+
+# Restart maas-controller to force fresh subscription + TRLP reconciliation.
+# Must happen AFTER creating subscriptions but BEFORE waiting for Active.
+# The controller can hit leader election timeout during initial subscription
+# creation, reading TRLP status before Kuadrant fully accepts it.
+- name: Restart maas-controller for subscription reconciliation
+  environment:
+    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+  ansible.builtin.shell: |
+    oc rollout restart deployment/maas-controller -n redhat-ods-applications
+    oc rollout status deployment/maas-controller -n redhat-ods-applications --timeout=180s
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Wait for MaaSModelRef Ready
   kubernetes.core.k8s_info:
     kubeconfig: "{{ admin_kubeconfig }}"
@@ -518,58 +641,21 @@
     or _modelref.resources | length == 0
     or _modelref.resources[0].status.phase | default('') != 'Ready'
 
-# --- Phase 5: Auth Policies + Subscriptions ---
-
-- name: Create MaaSAuthPolicy
-  kubernetes.core.k8s:
-    kubeconfig: "{{ admin_kubeconfig }}"
-    state: present
-    definition: "{{ lookup('ansible.builtin.template', 'maas-auth-policy.yaml.j2') | from_yaml }}"
-  register: _r
-  retries: 5
-  delay: 10
-  until: _r is not failed
-
-- name: Create MaaSSubscriptions
-  kubernetes.core.k8s:
-    kubeconfig: "{{ admin_kubeconfig }}"
-    state: present
-    definition: "{{ item }}"
-  loop: "{{ lookup('ansible.builtin.template', 'maas-subscriptions.yaml.j2') | from_yaml_all | list }}"
-  loop_control:
-    label: "{{ item.metadata.name }}"
-  register: _r
-  retries: 5
-  delay: 10
-  until: _r is not failed
-
+# RHOAI 3.5: gateway-level AuthPolicy in openshift-ingress (maas-gateway-auth).
+# RHOAI 3.4: per-model AuthPolicy in the model namespace.
 - name: Wait for auto-generated AuthPolicy
   kubernetes.core.k8s_info:
     kubeconfig: "{{ admin_kubeconfig }}"
     api_version: kuadrant.io/v1
     kind: AuthPolicy
-    namespace: "{{ ocp_4_20_ai_maas_model_namespace }}"
+    namespace: openshift-ingress
   register: _auth_policy
   retries: "{{ ocp_4_20_ai_maas_operator_retries }}"
   delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
   ignore_errors: true
   until:
     - _auth_policy.resources is defined
-    - _auth_policy.resources | length > 0
-
-# Restart maas-controller to force fresh subscription reconciliation.
-# The controller can hit a leader election timeout during initial subscription
-# creation, reading TRLP status before Kuadrant fully accepts it. Without a
-# restart, subscriptions stay Degraded and inference returns 403.
-- name: Restart maas-controller for subscription reconciliation
-  environment:
-    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
-  ansible.builtin.shell: |
-    oc rollout restart deployment/maas-controller -n redhat-ods-applications
-    oc rollout status deployment/maas-controller -n redhat-ods-applications --timeout=180s
-  args:
-    executable: /bin/bash
-  changed_when: true
+    - (_auth_policy.resources | selectattr('metadata.name', 'match', 'maas-gateway-auth') | list | length) > 0
 
 - name: Wait for all subscriptions Active
   kubernetes.core.k8s_info:

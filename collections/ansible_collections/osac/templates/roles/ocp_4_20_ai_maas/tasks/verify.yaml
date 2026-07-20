@@ -106,6 +106,9 @@
     validate_certs: false
   no_log: true
   register: _api_key_response
+  retries: 6
+  delay: 10
+  until: _api_key_response.status == 201
   when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
 - name: Report API key creation
@@ -174,7 +177,9 @@
         | list | length == 0
     fail_msg: "RHCL v1.4.0 detected — version pinning failed"
     success_msg: "All RHCL operators at v1.3.x — version pinning held"
-  when: ocp_4_20_ai_maas_enable_maas | bool
+  when:
+    - ocp_4_20_ai_maas_enable_maas | bool
+    - not (ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool)
 
 # --- Test 4b: Observability stack ---
 
@@ -265,6 +270,11 @@
   register: _free_key_response
   when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
 
+- name: Wait for TRLP enforcement warmup
+  ansible.builtin.pause:
+    seconds: 30
+  when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
+
 - name: Send requests to exhaust free tier (100 tokens/min)
   ansible.builtin.uri:
     url: "{{ _maas_api_url }}/llm/{{ ocp_4_20_ai_maas_model_name }}/v1/chat/completions"
@@ -306,4 +316,4 @@
       MaaS: {{ ocp_4_20_ai_maas_enable_maas | bool }},
       Keycloak: {{ ocp_4_20_ai_maas_enable_keycloak | bool }},
       Dashboard: {{ ocp_4_20_ai_maas_enable_dashboard | bool }},
-      {{ 'API key: created, Inference: 200, Rate limiting: 429, ' if (ocp_4_20_ai_maas_enable_keycloak | bool) else '' }}{{ 'Versions: all v1.3.x pinned, ' if (ocp_4_20_ai_maas_enable_maas | bool) else '' }}{{ 'Observability: COO+OTel+Perses' if (ocp_4_20_ai_maas_enable_observability | bool) else '' }}
+      {{ 'API key: created, Inference: 200, Rate limiting: 429, ' if (ocp_4_20_ai_maas_enable_keycloak | bool) else '' }}{{ 'Versions: RHCL 1.4.x (no pinning), ' if (ocp_4_20_ai_maas_skip_version_pinning | default(false) | bool) else ('Versions: all v1.3.x pinned, ' if (ocp_4_20_ai_maas_enable_maas | bool) else '') }}{{ 'Observability: COO+OTel+Perses' if (ocp_4_20_ai_maas_enable_observability | bool) else '' }}

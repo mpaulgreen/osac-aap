@@ -5,6 +5,9 @@ ocp_4_20_ai_maas_ocp_release_image: quay.io/openshift-release-dev/ocp-release:4.
 # Feature flags
 ocp_4_20_ai_maas_enable_maas: true
 ocp_4_20_ai_maas_enable_keycloak: true
+# Version pinning: false = pin RHCL 1.3.x + SM 3.2 (rate limiting works)
+#                  true  = use RHCL 1.4.x (auth works, TRLP broken in EA2)
+ocp_4_20_ai_maas_skip_version_pinning: false
 ocp_4_20_ai_maas_oidc_issuer: ""
 ocp_4_20_ai_maas_oidc_client_id: ""
 ocp_4_20_ai_maas_enable_observability: true
@@ -48,19 +51,18 @@ ocp_4_20_ai_maas_dsci_metrics_storage: 10Gi
 ocp_4_20_ai_maas_lws_channel: stable-v1.0
 ocp_4_20_ai_maas_lws_source: redhat-operators
 
-# RHOAI
-ocp_4_20_ai_maas_rhoai_channel: stable-3.4
+# RHOAI — beta channel for 3.5 EA2 (version 3.5.0-ea.2)
+ocp_4_20_ai_maas_rhoai_channel: beta
 ocp_4_20_ai_maas_rhoai_source: redhat-operators
 
 # --- DSC ---
-
+# RHOAI 3.5 uses DSC v2 — field names changed (aipipelines not datasciencepipelines,
+# removed codeflare/modelmeshserving, added ogx/mlflowoperator/trainer/sparkoperator)
 ocp_4_20_ai_maas_dsc_components:
-  codeflare: Removed
   dashboard: Managed
-  datasciencepipelines: Removed
+  aipipelines: Removed
   kserve: Managed
   kueue: Removed
-  modelmeshserving: Removed
   ray: Removed
   trainingoperator: Removed
   trustyai: Removed

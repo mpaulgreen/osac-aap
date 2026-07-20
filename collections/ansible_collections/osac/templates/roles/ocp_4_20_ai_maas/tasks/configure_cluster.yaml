@@ -51,7 +51,9 @@
   retries: 5
   delay: 10
   until: _r is not failed
-  when: ocp_4_20_ai_maas_enable_observability | bool
+  # RHOAI 3.5: MaaS controller checks for User Workload Monitoring ConfigMap.
+  # Without it, Tenant stays Degraded. Required for both observability AND MaaS.
+  when: (ocp_4_20_ai_maas_enable_observability | bool) or (ocp_4_20_ai_maas_enable_maas | bool)
 
 # --- openshift-ai-inference gateway ---
 # TEMPORARY WORKAROUND: RHOAI operator does not create openshift-ai-inference
